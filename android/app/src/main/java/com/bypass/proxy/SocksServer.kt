@@ -3,6 +3,7 @@ package com.bypass.proxy
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.IOException
+import java.net.ConnectException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -11,6 +12,7 @@ import kotlin.concurrent.thread
 
 /**
  * Android bağımlılıklarından arındırılmış, JVM üzerinde tamamen test edilebilir SOCKS5 Sunucusu.
+ * Edge case (uç durum) korumaları ile güçlendirilmiştir.
  */
 class SocksServer(
     private val port: Int,
@@ -59,18 +61,23 @@ class SocksServer(
             val clientInput = clientSocket.getInputStream()
             val clientOutput = clientSocket.getOutputStream()
 
-            // 1. Aşama: El Sıkışma
+            // 1. Aşama: El Sıkışma (Handshake)
             val version = clientInput.read()
+            if (version == -1) return // Edge Case: İstemci erken bağ kopardı
+            
             if (version != 5) {
                 logger(TAG, "Desteklenmeyen SOCKS sürümü: $version")
-                clientSocket.close()
-                return
+                return // Bağlantıyı hemen kes, SOCKS5 dışı isteklere yanıt verme
             }
 
             val nMethods = clientInput.read()
+            if (nMethods <= 0) return
+            
             val methods = ByteArray(nMethods)
-            clientInput.read(methods)
+            val bytesRead = clientInput.read(methods)
+            if (bytesRead != nMethods) return
 
+            // No Authentication (0x00) yanıtı dön
             clientOutput.write(byteArrayOf(5, 0))
             clientOutput.flush()
 
@@ -80,10 +87,12 @@ class SocksServer(
             clientInput.read() // RSV
             val atyp = clientInput.read()
 
-            if (reqVer != 5 || cmd != 1) { // Sadece CONNECT destekleniyor
+            if (reqVer == -1 || cmd == -1) return
+
+            // Edge Case: Desteklenmeyen komut (Sadece CONNECT=0x01 desteklenir, BIND=0x02 desteklenmez)
+            if (cmd != 1) {
                 logger(TAG, "Desteklenmeyen komut veya sürüm: CMD=$cmd")
-                sendErrorResponse(clientOutput, 0x07)
-                clientSocket.close()
+                sendErrorResponse(clientOutput, 0x07) // 0x07: Command not supported
                 return
             }
 
@@ -91,48 +100,55 @@ class SocksServer(
             when (atyp) {
                 1 -> { // IPv4
                     val ipv4 = ByteArray(4)
-                    clientInput.read(ipv4)
+                    if (clientInput.read(ipv4) != 4) return
                     host = InetAddress.getByAddress(ipv4).hostAddress
                 }
-                3 -> { // Domain
+                3 -> { // Domain Name
                     val len = clientInput.read()
+                    if (len <= 0) {
+                        sendErrorResponse(clientOutput, 0x08)
+                        return
+                    }
                     val domainBytes = ByteArray(len)
-                    clientInput.read(domainBytes)
+                    if (clientInput.read(domainBytes) != len) return
                     host = String(domainBytes)
                 }
                 4 -> { // IPv6
                     val ipv6 = ByteArray(16)
-                    clientInput.read(ipv6)
+                    if (clientInput.read(ipv6) != 16) return
                     host = InetAddress.getByAddress(ipv6).hostAddress
                 }
                 else -> {
-                    sendErrorResponse(clientOutput, 0x08)
-                    clientSocket.close()
+                    // Edge Case: Desteklenmeyen adres tipi
+                    sendErrorResponse(clientOutput, 0x08) // 0x08: Address type not supported
                     return
                 }
             }
 
             val portHigh = clientInput.read()
             val portLow = clientInput.read()
+            if (portHigh == -1 || portLow == -1) return
             val port = (portHigh shl 8) or portLow
 
             logger(TAG, "Bağlantı talebi: $host:$port")
 
             val remoteSocket = Socket()
-            
-            // Eğer Android tarafı bir ağ bağlayıcı (network binder) sağladıysa soketi o arayüze bağla
             networkBinder?.invoke(remoteSocket)
 
             try {
+                // Edge Case: Zaman aşımı ile bağlantı kurma
                 remoteSocket.connect(java.net.InetSocketAddress(host, port), 10000)
+            } catch (e: ConnectException) {
+                logger(TAG, "Bağlantı reddedildi: $host:$port")
+                sendErrorResponse(clientOutput, 0x05) // 0x05: Connection refused
+                return
             } catch (e: Exception) {
                 logger(TAG, "Hedefe bağlanılamadı: $host:$port. Hata: ${e.message}")
-                sendErrorResponse(clientOutput, 0x04)
-                clientSocket.close()
+                sendErrorResponse(clientOutput, 0x04) // 0x04: Host unreachable
                 return
             }
 
-            // Başarılı yanıtı gönder
+            // Başarılı bağlantı yanıtını gönder (0x00 Success)
             val successResponse = byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0)
             clientOutput.write(successResponse)
             clientOutput.flush()
@@ -167,7 +183,7 @@ class SocksServer(
                 output.flush()
             }
         } catch (e: IOException) {
-            // Soket kapandığında normal çıkış
+            // Soket kapandığında / İletişim koptuğunda normal çıkış
         }
     }
 

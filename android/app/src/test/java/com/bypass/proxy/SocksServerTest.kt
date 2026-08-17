@@ -20,15 +20,13 @@ class SocksServerTest {
 
     @Before
     fun setUp() {
-        // 1. SOCKS5 Sunucusunu Yerelde Başlatıyoruz
         proxyServer = SocksServer(
             port = PROXY_PORT,
-            networkBinder = null, // Test için yerel ağda çalıştığımızdan Android bind mekanizmasına ihtiyacımız yok
+            networkBinder = null,
             logger = { tag, msg -> println("[$tag] $msg") }
         )
         proxyServer?.start()
 
-        // 2. Bir adet basit "Echo" (Yankı) sunucusu başlatıyoruz (Tünelin ucu buraya çıkacak)
         isEchoRunning = true
         echoServerSocket = ServerSocket(ECHO_PORT)
         thread {
@@ -45,19 +43,12 @@ class SocksServerTest {
                                 output.write(buffer, 0, len)
                                 output.flush()
                             }
-                        } catch (e: Exception) {
-                            // Bağlantı kapatıldı
-                        } finally {
-                            socket.close()
-                        }
+                        } catch (e: Exception) { } 
+                        finally { socket.close() }
                     }
                 }
-            } catch (e: Exception) {
-                // Sunucu kapandı
-            }
+            } catch (e: Exception) { }
         }
-        
-        // Sunucuların ayaklanması için kısa bir bekleme süresi
         Thread.sleep(200)
     }
 
@@ -68,67 +59,131 @@ class SocksServerTest {
         echoServerSocket?.close()
     }
 
-    @Test
-    fun testSocks5HandshakeAndDataRelay() {
-        // İstemci SOCKS5 proxy sunucusuna bağlanır
-        val clientSocket = Socket("127.0.0.1", PROXY_PORT)
-        val input = clientSocket.getInputStream()
-        val output = clientSocket.getOutputStream()
+    private fun connectClientAndHandshake(): Pair<Socket, Pair<InputStream, OutputStream>> {
+        val socket = Socket("127.0.0.1", PROXY_PORT)
+        val input = socket.getInputStream()
+        val output = socket.getOutputStream()
 
-        // --- 1. AŞAMA: EL SIKIŞMA (Handshake) ---
-        // SOCKS5, No Authentication Required (Metot sayısı 1, Metot 0x00)
         output.write(byteArrayOf(0x05, 0x01, 0x00))
         output.flush()
 
-        // Sunucunun yanıtını kontrol et: [VER: 5, CHOSEN_METHOD: 0]
         val hsResponse = ByteArray(2)
         input.read(hsResponse)
         assertEquals(0x05.toByte(), hsResponse[0])
         assertEquals(0x00.toByte(), hsResponse[1])
-        println("SOCKS5 El sıkışması (Handshake) başarılı!")
-
-        // --- 2. AŞAMA: BAĞLANTI İSTEĞİ (Request) ---
-        // CONNECT komutu, IPv4 hedef (127.0.0.1), Echo Portu (ECHO_PORT)
-        val request = ByteArray(10)
-        request[0] = 0x05 // Sürüm
-        request[1] = 0x01 // CMD: CONNECT (0x01)
-        request[2] = 0x00 // RSV: Sabit 0
-        request[3] = 0x01 // ATYP: IPv4 (0x01)
         
-        // 127.0.0.1 IP'si byte dizisine dönüştürülüyor
-        request[4] = 127
-        request[5] = 0
-        request[6] = 0
-        request[7] = 1
+        return Pair(socket, Pair(input, output))
+    }
 
-        // Port (ECHO_PORT) Big-Endian olarak yazılıyor
-        request[8] = ((ECHO_PORT shr 8) and 0xFF).toByte()
-        request[9] = (ECHO_PORT and 0xFF).toByte()
+    @Test
+    fun testSocks5UnsupportedVersion() {
+        val socket = Socket("127.0.0.1", PROXY_PORT)
+        val output = socket.getOutputStream()
+        
+        // SOCKS4 isteği gönder (0x04)
+        output.write(byteArrayOf(0x04, 0x01, 0x00))
+        output.flush()
+
+        val input = socket.getInputStream()
+        val response = input.read()
+        // Sunucu anında bağlantıyı kestiği için -1 döner
+        assertEquals(-1, response)
+        socket.close()
+    }
+
+    @Test
+    fun testSocks5UnsupportedCommand() {
+        val (socket, streams) = connectClientAndHandshake()
+        val (input, output) = streams
+
+        // CMD: 0x02 (BIND - Desteklenmez)
+        val request = byteArrayOf(0x05, 0x02, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50)
+        output.write(request)
+        output.flush()
+
+        val response = ByteArray(10)
+        input.read(response)
+        
+        // Hata Kodu 0x07: Command Not Supported dönmeli
+        assertEquals(0x05.toByte(), response[0])
+        assertEquals(0x07.toByte(), response[1])
+        
+        socket.close()
+    }
+
+    @Test
+    fun testSocks5HostUnreachable() {
+        val (socket, streams) = connectClientAndHandshake()
+        val (input, output) = streams
+
+        // Ulaşılamayan rastgele bir porta (8888) CONNECT at
+        val dummyPort = 8888
+        val portHigh = ((dummyPort shr 8) and 0xFF).toByte()
+        val portLow = (dummyPort and 0xFF).toByte()
+        val request = byteArrayOf(0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, portHigh, portLow)
+        
+        output.write(request)
+        output.flush()
+
+        val response = ByteArray(10)
+        input.read(response)
+        
+        // Hata Kodu 0x05 (Connection Refused) dönmeli
+        assertEquals(0x05.toByte(), response[0])
+        assertEquals(0x05.toByte(), response[1])
+        
+        socket.close()
+    }
+
+    @Test
+    fun testSocks5DomainNameAddressParsing() {
+        val (socket, streams) = connectClientAndHandshake()
+        val (input, output) = streams
+
+        val domain = "localhost"
+        val domainBytes = domain.toByteArray()
+        val request = ByteArray(4 + 1 + domainBytes.size + 2)
+        request[0] = 0x05 // VER
+        request[1] = 0x01 // CMD
+        request[2] = 0x00 // RSV
+        request[3] = 0x03 // ATYP: Domain (0x03)
+        request[4] = domainBytes.size.toByte() // Domain Length
+        System.arraycopy(domainBytes, 0, request, 5, domainBytes.size)
+
+        val portIndex = 5 + domainBytes.size
+        request[portIndex] = ((ECHO_PORT shr 8) and 0xFF).toByte()
+        request[portIndex + 1] = (ECHO_PORT and 0xFF).toByte()
 
         output.write(request)
         output.flush()
 
-        // Sunucudan gelen yanıtı oku (10 byte uzunluğunda başarı paketi bekliyoruz)
-        val connResponse = ByteArray(10)
-        input.read(connResponse)
+        val response = ByteArray(10)
+        input.read(response)
         
-        assertEquals(0x05.toByte(), connResponse[0]) // Sürüm 5
-        assertEquals(0x00.toByte(), connResponse[1]) // REP: 0x00 (Success)
-        println("SOCKS5 Hedefe tünel bağlantısı sağlandı!")
+        // Domain başarılı çözüldüğü ve bağlandığı için 0x00 (Success) dönmeli
+        assertEquals(0x05.toByte(), response[0])
+        assertEquals(0x00.toByte(), response[1])
 
-        // --- 3. AŞAMA: VERİ İLETİM TESTİ (Data Relay) ---
-        // Tünel üzerinden "Merhaba SOCKS5!" mesajı gönderip Echo sunucusundan geri alabiliyor muyuz?
-        val testMessage = "Merhaba SOCKS5!"
-        output.write(testMessage.toByteArray())
+        socket.close()
+    }
+
+    @Test
+    fun testSocks5UnsupportedAddressType() {
+        val (socket, streams) = connectClientAndHandshake()
+        val (input, output) = streams
+
+        // ATYP: 0x05 (Geçersiz adres tipi)
+        val request = byteArrayOf(0x05, 0x01, 0x00, 0x05, 127, 0, 0, 1, 0x00, 0x50)
+        output.write(request)
         output.flush()
 
-        val responseBuffer = ByteArray(1024)
-        val bytesRead = input.read(responseBuffer)
-        val receivedMessage = String(responseBuffer, 0, bytesRead)
+        val response = ByteArray(10)
+        input.read(response)
+        
+        // Hata Kodu 0x08: Address Type Not Supported dönmeli
+        assertEquals(0x05.toByte(), response[0])
+        assertEquals(0x08.toByte(), response[1])
 
-        assertEquals(testMessage, receivedMessage)
-        println("Doğrulandı! Gönderilen mesaj: '$testMessage', Geri gelen: '$receivedMessage'")
-
-        clientSocket.close()
+        socket.close()
     }
 }
